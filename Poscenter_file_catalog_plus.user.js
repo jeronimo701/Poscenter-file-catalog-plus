@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         POScenter Files: удобные папки и массовая загрузка
 // @namespace    https://fs.poscenter.org/
-// @version      1.0.8
+// @version      1.0.9
 // @description  Открытие папок по названию, скачивание, просмотр и ссылки на файлы.
 // @match        https://fs.poscenter.org/*
 // @run-at       document-idle
 // @grant        none
 // @author       Jeronimo701
 // @license      LicenseRef-Jeronimo701-Personal-Use-1.0
-// @updateURL    https://gist.githubusercontent.com/jeronimo701/59bda3878da869e16e54c3f22084f9b3/raw/Poscenter_file_catalog_plus.user.js
-// @downloadURL  https://gist.githubusercontent.com/jeronimo701/59bda3878da869e16e54c3f22084f9b3/raw/Poscenter_file_catalog_plus.user.js
+// @updateURL    none
+// @homepageURL  https://github.com/jeronimo701/Poscenter-file-catalog-plus
 // ==/UserScript==
 
 (function () {
