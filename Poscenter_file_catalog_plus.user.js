@@ -1,15 +1,16 @@
 // ==UserScript==
 // @name         POScenter Files: удобные папки и массовая загрузка
 // @namespace    https://fs.poscenter.org/
-// @version      1.0.9
-// @description  Открытие папок по названию, скачивание, просмотр и ссылки на файлы.
+// @version      1.1.1
+// @description  Рекурсивный поиск по папкам и хранилищу, скачивание, просмотр и ссылки на файлы.
 // @match        https://fs.poscenter.org/*
 // @run-at       document-idle
 // @grant        none
 // @author       Jeronimo701
 // @license      LicenseRef-Jeronimo701-Personal-Use-1.0
-// @updateURL    none
 // @homepageURL  https://github.com/jeronimo701/Poscenter-file-catalog-plus
+// @updateURL    https://raw.githubusercontent.com/jeronimo701/Poscenter-file-catalog-plus/main/Poscenter_file_catalog_plus.meta.js
+// @downloadURL  https://raw.githubusercontent.com/jeronimo701/Poscenter-file-catalog-plus/main/Poscenter_file_catalog_plus.user.js
 // ==/UserScript==
 
 (function () {
@@ -44,6 +45,386 @@
     scheduleEnhanceFolders();
     const list = document.getElementById('list');
     if (list) new MutationObserver(scheduleEnhanceFolders).observe(list, { childList: true, subtree: true });
+    installSearch();
+
+    function installSearch() {
+        const catalogPanel = list?.closest('.panel') || list?.parentElement;
+        const toolbar = document.querySelector('.toolbar');
+        if (!catalogPanel || !toolbar || document.getElementById('poscenter-search')) return;
+        const memory = new Map();
+        const collator = new Intl.Collator('ru', { numeric: true, sensitivity: 'base' });
+        let databasePromise;
+        let job = null;
+        let requestId = 0;
+        let debounce;
+        let matches = [];
+        let shown = 0;
+        let selectedIndex = null;
+        let scope = 'folder';
+        try { scope = localStorage.getItem('poscenter-search-scope') === 'all' ? 'all' : 'folder'; } catch (_) {}
+
+        const panel = document.createElement('section');
+        panel.id = 'poscenter-search';
+        panel.innerHTML = `
+            <div class="poscenter-search-controls">
+                <input type="search" aria-label="Поиск файлов и папок" placeholder="Название файла, папки или часть пути" autocomplete="off">
+                <div class="poscenter-search-scopes" role="group" aria-label="Область поиска">
+                    <button type="button" data-scope="folder">Эта папка и подпапки</button>
+                    <button type="button" data-scope="all">Всё хранилище</button>
+                </div>
+                <button type="button" class="poscenter-search-refresh" title="Заново загрузить список файлов для выбранной области">Обновить индекс</button>
+                <button type="button" class="poscenter-search-stop" hidden>Остановить</button>
+            </div>
+            <div class="poscenter-search-location"></div>
+            <div class="poscenter-search-status" role="status" aria-live="polite"></div>
+            <progress aria-label="Загрузка поискового индекса" hidden></progress>
+            <div class="poscenter-search-results" hidden>
+                <div class="poscenter-search-items"></div>
+                <button type="button" class="poscenter-search-more" hidden>Показать ещё</button>
+            </div>`;
+        const input = panel.querySelector('input');
+        const status = panel.querySelector('.poscenter-search-status');
+        const locationLabel = panel.querySelector('.poscenter-search-location');
+        const results = panel.querySelector('.poscenter-search-results');
+        const items = panel.querySelector('.poscenter-search-items');
+        const more = panel.querySelector('.poscenter-search-more');
+        const refresh = panel.querySelector('.poscenter-search-refresh');
+        const stop = panel.querySelector('.poscenter-search-stop');
+        const progress = panel.querySelector('progress');
+        const main = toolbar.closest('main') || toolbar.parentElement;
+        main.prepend(panel);
+        results.id = 'poscenter-search-output';
+        results.prepend(status, progress);
+        catalogPanel.before(results);
+
+        function currentPrefix() {
+            try { return decodeURIComponent(location.hash.replace(/^#\/?/, '')); }
+            catch (_) { return ''; }
+        }
+
+        function searchPrefix() { return scope === 'all' ? '' : currentPrefix(); }
+        function normalize(text) { return String(text).normalize('NFKC').toLocaleLowerCase('ru').replace(/ё/g, 'е'); }
+
+        function updateScope() {
+            panel.querySelectorAll('[data-scope]').forEach((button) => {
+                button.setAttribute('aria-pressed', String(button.dataset.scope === scope));
+            });
+            locationLabel.textContent = scope === 'all' ? 'Всё хранилище' : `${currentPrefix() || 'Корень'} · включая подпапки`;
+        }
+
+        function setLoading(loading) {
+            progress.hidden = !loading;
+            stop.hidden = !loading;
+            refresh.disabled = loading || !input.value.trim();
+        }
+
+        function abortJob() {
+            job?.controller.abort();
+            job = null;
+            setLoading(false);
+        }
+
+        function clearSearch() {
+            clearTimeout(debounce);
+            requestId += 1;
+            abortJob();
+            matches = [];
+            selectedIndex = null;
+            items.replaceChildren();
+            results.hidden = true;
+            status.textContent = '';
+            catalogPanel.classList.remove('poscenter-search-catalog-hidden');
+        }
+
+        function database() {
+            if (databasePromise) return databasePromise;
+            databasePromise = new Promise((resolve) => {
+                let done = false;
+                const finish = (db) => {
+                    if (done) { db?.close(); return; }
+                    done = true;
+                    clearTimeout(timeout);
+                    resolve(db);
+                };
+                const timeout = window.setTimeout(() => finish(null), 2500);
+                try {
+                    const opening = indexedDB.open('poscenter-file-search', 1);
+                    opening.onupgradeneeded = () => opening.result.createObjectStore('indexes', { keyPath: 'prefix' });
+                    opening.onsuccess = () => finish(opening.result);
+                    opening.onerror = () => finish(null);
+                    opening.onblocked = () => finish(null);
+                } catch (_) { finish(null); }
+            });
+            return databasePromise;
+        }
+
+        async function readCache(prefix) {
+            if (memory.has(prefix)) return memory.get(prefix);
+            const db = await database();
+            if (!db) return null;
+            return new Promise((resolve) => {
+                try {
+                    const reading = db.transaction('indexes').objectStore('indexes').get(prefix);
+                    reading.onsuccess = () => {
+                        const record = reading.result;
+                        if (record && Array.isArray(record.entries) && Number.isFinite(record.savedAt)) {
+                            memory.set(prefix, record);
+                            resolve(record);
+                        } else { resolve(null); }
+                    };
+                    reading.onerror = () => resolve(null);
+                } catch (_) { resolve(null); }
+            });
+        }
+
+        async function writeCache(record) {
+            memory.set(record.prefix, record);
+            const db = await database();
+            if (!db) return false;
+            return new Promise((resolve) => {
+                try {
+                    const transaction = db.transaction('indexes', 'readwrite');
+                    transaction.objectStore('indexes').put({ prefix: record.prefix, savedAt: record.savedAt, entries: record.entries });
+                    transaction.oncomplete = () => resolve(true);
+                    transaction.onerror = transaction.onabort = () => resolve(false);
+                } catch (_) { resolve(false); }
+            });
+        }
+
+        async function cachedIndex(prefix) {
+            const direct = await readCache(prefix);
+            const global = prefix ? await readCache('') : null;
+            return direct && (!global || direct.savedAt >= global.savedAt) ? direct : global;
+        }
+
+        async function fetchIndex(prefix, controller, onPage) {
+            const entries = new Map();
+            const tokens = new Set();
+            let token = '';
+            let pages = 0;
+            let fileCount = 0;
+            do {
+                const url = new URL(`${STORAGE_ORIGIN}/${BUCKET_NAME}`);
+                url.searchParams.set('list-type', '2');
+                url.searchParams.set('prefix', prefix);
+                url.searchParams.set('max-keys', '1000');
+                if (token) url.searchParams.set('continuation-token', token);
+                const response = await fetch(url, { method: 'GET', signal: controller.signal });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const xml = new DOMParser().parseFromString(await response.text(), 'application/xml');
+                if (xml.querySelector('parsererror, Error')) throw new Error('Некорректный ответ хранилища');
+                for (const node of xml.querySelectorAll('Contents')) {
+                    const key = node.querySelector('Key')?.textContent || '';
+                    if (!key || !key.startsWith(prefix) || shouldHideKey(key)) continue;
+                    const folder = key.endsWith('/');
+                    if (key !== prefix && !entries.has(key)) {
+                        entries.set(key, {
+                            key, folder,
+                            size: Number(node.querySelector('Size')?.textContent || 0),
+                            modified: node.querySelector('LastModified')?.textContent || '',
+                        });
+                        if (!folder) fileCount += 1;
+                    }
+                    let end = key.lastIndexOf('/', key.length - 2);
+                    if (!folder) end = key.lastIndexOf('/');
+                    while (end >= prefix.length) {
+                        const parent = key.slice(0, end + 1);
+                        if (parent !== prefix && !entries.has(parent)) {
+                            entries.set(parent, { key: parent, folder: true, size: 0, modified: '' });
+                        }
+                        end = key.lastIndexOf('/', end - 1);
+                    }
+                }
+                pages += 1;
+                onPage(pages, fileCount);
+                const truncated = xml.querySelector('IsTruncated')?.textContent?.toLowerCase() === 'true';
+                if (!truncated) break;
+                token = xml.querySelector('NextContinuationToken')?.textContent || '';
+                if (!token || tokens.has(token)) throw new Error('Хранилище не вернуло следующую страницу списка');
+                tokens.add(token);
+            } while (token);
+            const record = { prefix, savedAt: Date.now(), entries: Array.from(entries.values()) };
+            record.entries.sort((a, b) => Number(b.folder) - Number(a.folder) || collator.compare(a.key, b.key));
+            if (controller.signal.aborted) throw new DOMException('Поиск остановлен', 'AbortError');
+            record.persistent = await writeCache(record);
+            return record;
+        }
+
+        function resultButton(label, action, title) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = label;
+            if (title) button.title = title;
+            button.addEventListener('click', action);
+            return button;
+        }
+
+        function renderPage(reset = false) {
+            if (reset) { shown = 0; items.replaceChildren(); }
+            const fragment = document.createDocumentFragment();
+            const next = matches.slice(shown, shown + 100);
+            for (const entry of next) {
+                const row = document.createElement('div');
+                row.className = 'poscenter-search-item';
+                row.dataset.key = entry.key;
+                const info = document.createElement('div');
+                info.className = 'poscenter-search-info';
+                const name = document.createElement('a');
+                name.className = 'poscenter-search-name';
+                name.textContent = entry.key.replace(/\/$/, '').split('/').pop();
+                const fileUrl = `${DOWNLOAD_ORIGIN}/${entry.key.split('/').map(encodeURIComponent).join('/')}`;
+                const extension = name.textContent.match(/\.([a-z0-9]{1,8})$/i)?.[1].toLowerCase() || '';
+                if (entry.folder) {
+                    name.href = `#/${encodeReadablePath(entry.key)}`;
+                } else {
+                    name.href = fileUrl;
+                    if (PREVIEWABLE_EXTENSIONS.has(extension)) {
+                        name.target = '_blank';
+                        name.rel = 'noopener noreferrer';
+                    } else { name.download = name.textContent; }
+                }
+                const path = document.createElement('div');
+                path.className = 'poscenter-search-path';
+                path.textContent = entry.key;
+                const meta = document.createElement('div');
+                meta.className = 'poscenter-search-meta';
+                const size = entry.size < 1024 * 1024 ? `${(entry.size / 1024).toFixed(1)} КБ` : `${(entry.size / 1024 / 1024).toFixed(1)} МБ`;
+                meta.textContent = entry.folder ? 'Папка' : `${extension.toUpperCase() || 'Файл'} · ${size}`;
+                info.append(name, path, meta);
+                const actions = document.createElement('div');
+                actions.className = 'poscenter-search-actions';
+                if (entry.folder) {
+                    const open = document.createElement('a');
+                    open.href = name.href;
+                    open.textContent = 'Открыть папку';
+                    actions.append(open, resultButton('Скачать всё', () => startFolderDownload(entry.key)));
+                } else {
+                    if (PREVIEWABLE_EXTENSIONS.has(extension)) {
+                        const open = document.createElement('a');
+                        open.href = fileUrl;
+                        open.textContent = 'Открыть';
+                        open.target = '_blank';
+                        open.rel = 'noopener noreferrer';
+                        actions.append(open);
+                    }
+                    const download = document.createElement('a');
+                    download.href = fileUrl;
+                    download.download = name.textContent;
+                    download.textContent = 'Скачать';
+                    actions.append(download);
+                }
+                const copy = resultButton('Ссылка', async () => {
+                    const url = entry.folder ? `${DOWNLOAD_ORIGIN}/#/${encodeReadablePath(entry.key)}` : getReadableUrl(fileUrl);
+                    if (!await copyLink(url)) return;
+                    copy.textContent = 'Скопировано';
+                    window.setTimeout(() => { copy.textContent = 'Ссылка'; }, 1400);
+                }, 'Скопировать ссылку');
+                copy.className = 'poscenter-search-copy';
+                actions.append(copy);
+                row.append(info, actions);
+                fragment.append(row);
+            }
+            items.append(fragment);
+            shown += next.length;
+            more.hidden = shown >= matches.length;
+            more.textContent = `Показать ещё (${shown} из ${matches.length})`;
+        }
+
+        function renderMatches(record, prefix) {
+            if (!record.searchRows) record.searchRows = record.entries.map((entry) => ({ entry, text: normalize(entry.key) }));
+            const words = normalize(input.value.trim()).split(/\s+/).filter(Boolean);
+            matches = record.searchRows.filter(({ entry, text }) => entry.key !== prefix && entry.key.startsWith(prefix)
+                && words.every((word) => text.includes(word))).map(({ entry }) => entry);
+            renderPage(true);
+            const folders = matches.reduce((total, entry) => total + Number(entry.folder), 0);
+            const files = matches.length - folders;
+            const noun = (count, one, few, many) => count % 100 >= 11 && count % 100 <= 14 ? many
+                : count % 10 === 1 ? one : count % 10 >= 2 && count % 10 <= 4 ? few : many;
+            const stamp = new Date(record.savedAt).toLocaleString('ru-RU');
+            status.textContent = `Найдено: ${files} ${noun(files, 'файл', 'файла', 'файлов')}, ${folders} ${noun(folders, 'папка', 'папки', 'папок')} · Индекс: ${stamp}`;
+            if (record.persistent === false) status.textContent += ' · Кеш доступен до закрытия вкладки';
+        }
+
+        async function search(force = false) {
+            clearTimeout(debounce);
+            if (!input.value.trim()) { clearSearch(); return; }
+            const id = ++requestId;
+            const prefix = searchPrefix();
+            results.hidden = false;
+            catalogPanel.classList.add('poscenter-search-catalog-hidden');
+            status.textContent = 'Читаю индекс…';
+            let cached = null;
+            try {
+                cached = await cachedIndex(prefix);
+                if (id !== requestId) return;
+                if (cached) {
+                    selectedIndex = cached;
+                    renderMatches(cached, prefix);
+                } else { items.replaceChildren(); more.hidden = true; }
+                if (job && (force || job.prefix !== prefix)) abortJob();
+                if (!force && cached && Date.now() - cached.savedAt < 24 * 60 * 60 * 1000 && !job) return;
+                if (!job) {
+                    const controller = new AbortController();
+                    const task = { prefix, controller };
+                    job = task;
+                    task.promise = fetchIndex(prefix, controller, (pages, found) => {
+                        if (job === task) status.textContent = `Загружаю индекс: страниц ${pages}, файлов ${found}${cached ? ' · показан сохранённый список' : ''}`;
+                    });
+                }
+                const task = job;
+                setLoading(true);
+                status.textContent = cached ? 'Обновляю индекс · показан сохранённый список…' : 'Загружаю список файлов и папок…';
+                const record = await task.promise;
+                if (id !== requestId) return;
+                selectedIndex = record;
+                renderMatches(record, prefix);
+            } catch (error) {
+                if (id !== requestId) return;
+                if (error.name === 'AbortError') {
+                    if (selectedIndex) renderMatches(selectedIndex, prefix);
+                    status.textContent = `Загрузка индекса остановлена${selectedIndex ? ' · показан сохранённый список' : ''}`;
+                } else {
+                    status.textContent = `Ошибка загрузки индекса: ${error.message}${cached ? ' · показан сохранённый список' : ''}`;
+                }
+            } finally {
+                if (id === requestId) { job = null; setLoading(false); }
+            }
+        }
+
+        input.addEventListener('input', () => {
+            clearTimeout(debounce);
+            if (!input.value.trim()) { clearSearch(); return; }
+            if (!job) refresh.disabled = false;
+            debounce = window.setTimeout(() => search(), 220);
+        });
+        input.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') { event.preventDefault(); search(); }
+            if (event.key === 'Escape') { input.value = ''; clearSearch(); input.focus(); }
+        });
+        panel.querySelectorAll('[data-scope]').forEach((button) => button.addEventListener('click', () => {
+            if (scope === button.dataset.scope) return;
+            requestId += 1;
+            abortJob();
+            selectedIndex = null;
+            scope = button.dataset.scope;
+            try { localStorage.setItem('poscenter-search-scope', scope); } catch (_) {}
+            updateScope();
+            search();
+        }));
+        refresh.addEventListener('click', () => {
+            if (!input.value.trim()) { input.focus(); return; }
+            search(true);
+        });
+        stop.addEventListener('click', () => job?.controller.abort());
+        more.addEventListener('click', () => renderPage());
+        window.addEventListener('hashchange', () => {
+            input.value = '';
+            clearSearch();
+            updateScope();
+        });
+        updateScope();
+        setLoading(false);
+    }
 
     function scheduleEnhanceFolders() {
         if (enhancementQueued) return;
@@ -323,6 +704,42 @@
     function injectStyles() {
         const style = document.createElement('style');
         style.textContent = `
+            #poscenter-search, #poscenter-search-output { padding:16px; background:var(--surface,#fff); color:var(--text,#1b2430); border:1px solid var(--border,#dbe4f0); border-radius:8px; }
+            #poscenter-search { margin:0 0 18px; }
+            #poscenter-search-output { margin:18px 0; }
+            .poscenter-search-controls { display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+            #poscenter-search input { flex:1 1 270px; min-width:0; width:100%; height:40px; padding:8px 12px; color:var(--text,#1b2430); background:var(--surface,#fff); border:1px solid var(--border,#dbe4f0); border-radius:6px; font:inherit; }
+            #poscenter-search input:focus-visible { outline:2px solid var(--accent,#005ff9); outline-offset:1px; }
+            #poscenter-search button, #poscenter-search-output button, .poscenter-search-actions a { min-height:36px; padding:6px 10px; border:1px solid var(--border,#dbe4f0); border-radius:6px; background:var(--surface-2,#f7f9fd); color:var(--text,#1b2430); font:inherit; font-size:14px; line-height:1.4; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; justify-content:center; }
+            #poscenter-search button:disabled { opacity:.5; cursor:default; }
+            #poscenter-search button:hover:not(:disabled), #poscenter-search-output button:hover, .poscenter-search-actions a:hover { background:var(--surface-3,#eef3fb); }
+            .poscenter-search-scopes { display:flex; flex:0 1 auto; }
+            #poscenter-search .poscenter-search-scopes button { border-radius:0; min-height:40px; }
+            #poscenter-search .poscenter-search-scopes button:first-child { border-radius:6px 0 0 6px; }
+            #poscenter-search .poscenter-search-scopes button:last-child { border-radius:0 6px 6px 0; border-left:0; }
+            #poscenter-search .poscenter-search-scopes button[aria-pressed="true"] { background:var(--accent,#005ff9); color:#fff; }
+            #poscenter-search .poscenter-search-scopes button[aria-pressed="true"]:hover { background:var(--accent-hover,#0047c2); }
+            .poscenter-search-location { margin-top:8px; color:var(--muted,#6b7280); font-size:13px; overflow-wrap:anywhere; }
+            .poscenter-search-status { margin-top:6px; font-size:14px; overflow-wrap:anywhere; }
+            #poscenter-search-output progress { display:block; width:100%; height:7px; margin:10px 0; accent-color:var(--accent,#005ff9); }
+            #poscenter-search [hidden], #poscenter-search-output[hidden], #poscenter-search-output [hidden], .poscenter-search-catalog-hidden { display:none!important; }
+            .poscenter-search-results { margin-top:12px; border-top:1px solid var(--border,#dbe4f0); }
+            .poscenter-search-item { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:14px; padding:14px 0; border-bottom:1px solid var(--border,#dbe4f0); }
+            .poscenter-search-info { min-width:0; }
+            .poscenter-search-name { color:var(--text,#1b2430); font-weight:700; text-decoration:none; overflow-wrap:anywhere; }
+            .poscenter-search-name:hover { text-decoration:underline; }
+            .poscenter-search-path { color:var(--muted,#6b7280); font-size:13px; overflow-wrap:anywhere; margin-top:3px; }
+            .poscenter-search-meta { color:var(--muted,#6b7280); font-size:12px; margin-top:3px; }
+            .poscenter-search-actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:flex-end; }
+            #poscenter-search-output .poscenter-search-copy { width:112px; }
+            #poscenter-search-output .poscenter-search-more { margin-top:14px; }
+            @media(max-width:700px) {
+                #poscenter-search input { flex-basis:100%; }
+                .poscenter-search-scopes { flex:1 1 100%; }
+                #poscenter-search .poscenter-search-scopes button { flex:1; }
+                .poscenter-search-item { grid-template-columns:minmax(0,1fr); gap:10px; }
+                .poscenter-search-actions { justify-content:flex-start; }
+            }
             @media (min-width:861px) {
                 #list .row.poscenter-file-row { grid-template-columns:minmax(180px,1.8fr) 65px minmax(125px,150px) 185px; }
                 #list .row.poscenter-previewable-file { grid-template-columns:minmax(180px,1.8fr) 65px minmax(125px,150px) 275px; }

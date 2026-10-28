@@ -4,7 +4,11 @@
   "source_commit": "cb17914a9118f0efcbf09995a73bec3f8073dff3",
   "source_tree": "e080cd9fd9f8acff34adafe471454390e92c6224",
   "destination": "https://github.com/jeronimo701/Poscenter-file-catalog-plus",
-  "private": true,
+  "private": false,
   "history_preserved": true,
-  "old_gist_to_be_deleted_after_verification": true
+  "old_gist_to_be_deleted_after_verification": false,
+  "private_at_migration": true,
+  "old_gist_deleted": true,
+  "visibility_changed": "2026-10-28",
+  "automatic_updates": true
 }
